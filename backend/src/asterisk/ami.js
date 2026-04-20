@@ -2,41 +2,48 @@ const AsteriskManager = require('asterisk-manager');
 const { pool } = require('../db/pool');
 
 let ami = null;
+let amiConnected = false;
 
 async function initAMI() {
-  return new Promise((resolve) => {
-    try {
-      ami = new AsteriskManager(
-        process.env.ASTERISK_AMI_PORT || 5038,
-        process.env.ASTERISK_HOST || 'localhost',
-        process.env.ASTERISK_AMI_USER || 'ccadmin',
-        process.env.ASTERISK_AMI_SECRET || 'amipassword',
-        true
-      );
+  // Non-blocking — returns immediately, connects in background
+  connectAMI();
+  return Promise.resolve();
+}
 
-      ami.keepConnected();
+function connectAMI() {
+  try {
+    ami = new AsteriskManager(
+      parseInt(process.env.ASTERISK_AMI_PORT) || 5038,
+      process.env.ASTERISK_HOST || '127.0.0.1',
+      process.env.ASTERISK_AMI_USER || 'ccadmin',
+      process.env.ASTERISK_AMI_SECRET || 'amipassword',
+      true
+    );
 
-      ami.on('connect', () => {
-        console.log('✅ AMI connected');
-        setupEventHandlers();
-        resolve(ami);
-      });
+    ami.keepConnected();
 
-      ami.on('error', (err) => {
-        console.warn('⚠️  AMI error (non-fatal):', err.message);
-      });
+    ami.on('connect', () => {
+      amiConnected = true;
+      console.log('✅ Asterisk AMI connected');
+      setupEventHandlers();
+    });
 
-      // Timeout — backend starts even without AMI
-      setTimeout(() => {
-        console.warn('⚠️  AMI timeout — continuing without AMI');
-        resolve(null);
-      }, 8000);
+    ami.on('close', () => {
+      amiConnected = false;
+      console.warn('⚠️  AMI disconnected — will retry automatically');
+    });
 
-    } catch (err) {
-      console.warn('⚠️  AMI init failed (non-fatal):', err.message);
-      resolve(null);
-    }
-  });
+    ami.on('error', (err) => {
+      amiConnected = false;
+      // Suppress ECONNREFUSED spam — Asterisk may not be ready yet
+      if (err.code !== 'ECONNREFUSED') {
+        console.warn('⚠️  AMI error:', err.message);
+      }
+    });
+
+  } catch (err) {
+    console.warn('⚠️  AMI init error (non-fatal):', err.message);
+  }
 }
 
 function setupEventHandlers() {
@@ -57,7 +64,6 @@ function setupEventHandlers() {
          FROM queues q WHERE q.asterisk_name = $5`,
         [tenantId, uniqueid, calleridnum, destchannel || queue, queue]
       );
-
       global.io?.to(`tenant:${tenantId}`).emit('call:incoming', {
         uniqueid, callerNumber: calleridnum, queue
       });
@@ -70,7 +76,6 @@ function setupEventHandlers() {
     try {
       const { member, uniqueid } = event;
       const sipUser = member?.replace(/^SIP\//, '').split('-')[0];
-
       const agentResult = await pool.query(
         'SELECT * FROM agents WHERE sip_username = $1', [sipUser]
       );
@@ -82,12 +87,10 @@ function setupEventHandlers() {
          WHERE asterisk_uniqueid = $2 RETURNING *`,
         [agent.id, uniqueid]
       );
-
       if (callResult.rows[0]) {
         const call = callResult.rows[0];
         const waitSecs = Math.round((new Date() - new Date(call.started_at)) / 1000);
         await pool.query('UPDATE calls SET wait_time_seconds = $1 WHERE id = $2', [waitSecs, call.id]);
-
         global.io?.to(`tenant:${call.tenant_id}`).emit('call:answered', {
           uniqueid, agentId: agent.id, agentName: agent.name
         });
@@ -110,7 +113,6 @@ function setupEventHandlers() {
          WHERE asterisk_uniqueid = $2 AND ended_at IS NULL RETURNING *`,
         [parseInt(duration) || 0, uniqueid]
       );
-
       if (callResult.rows[0]) {
         const call = callResult.rows[0];
         if (call.agent_id) {
@@ -146,8 +148,8 @@ function setupEventHandlers() {
 }
 
 async function reloadAsteriskSIP() {
+  if (!amiConnected) throw new Error('AMI not connected');
   return new Promise((resolve, reject) => {
-    if (!ami) return reject(new Error('AMI not connected'));
     ami.action({ action: 'command', command: 'sip reload' }, (err, res) => {
       if (err) return reject(err);
       resolve(res);
@@ -156,8 +158,8 @@ async function reloadAsteriskSIP() {
 }
 
 async function getAsteriskStatus() {
+  if (!amiConnected) throw new Error('AMI not connected');
   return new Promise((resolve, reject) => {
-    if (!ami) return reject(new Error('AMI not connected'));
     ami.action({ action: 'CoreStatus' }, (err, res) => {
       if (err) return reject(err);
       resolve(res);
