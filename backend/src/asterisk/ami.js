@@ -4,46 +4,53 @@ const { pool } = require('../db/pool');
 let ami = null;
 
 async function initAMI() {
-  return new Promise((resolve, reject) => {
-    ami = new AsteriskManager(
-      process.env.ASTERISK_AMI_PORT || 5038,
-      process.env.ASTERISK_HOST || 'localhost',
-      process.env.ASTERISK_AMI_USER || 'ccadmin',
-      process.env.ASTERISK_AMI_SECRET || 'amipassword',
-      true // enable events
-    );
+  return new Promise((resolve) => {
+    try {
+      ami = new AsteriskManager(
+        process.env.ASTERISK_AMI_PORT || 5038,
+        process.env.ASTERISK_HOST || 'localhost',
+        process.env.ASTERISK_AMI_USER || 'ccadmin',
+        process.env.ASTERISK_AMI_SECRET || 'amipassword',
+        true
+      );
 
-    ami.keepConnected();
+      ami.keepConnected();
 
-    ami.on('connect', () => {
-      console.log('✅ AMI connected');
-      setupEventHandlers();
-      resolve(ami);
-    });
+      ami.on('connect', () => {
+        console.log('✅ AMI connected');
+        setupEventHandlers();
+        resolve(ami);
+      });
 
-    ami.on('error', (err) => {
-      console.error('AMI error:', err.message);
-      reject(err);
-    });
+      ami.on('error', (err) => {
+        console.warn('⚠️  AMI error (non-fatal):', err.message);
+      });
 
-    setTimeout(() => reject(new Error('AMI connection timeout')), 10000);
+      // Timeout — backend starts even without AMI
+      setTimeout(() => {
+        console.warn('⚠️  AMI timeout — continuing without AMI');
+        resolve(null);
+      }, 8000);
+
+    } catch (err) {
+      console.warn('⚠️  AMI init failed (non-fatal):', err.message);
+      resolve(null);
+    }
   });
 }
 
 function setupEventHandlers() {
-  // New incoming call
+  if (!ami) return;
+
   ami.on('QueueCallerJoin', async (event) => {
     try {
       const { calleridnum, destchannel, queue, uniqueid } = event;
-
-      // Find tenant by queue name
       const queueResult = await pool.query(
         'SELECT tenant_id FROM queues WHERE asterisk_name = $1', [queue]
       );
       if (!queueResult.rows[0]) return;
       const tenantId = queueResult.rows[0].tenant_id;
 
-      // Log call start
       await pool.query(
         `INSERT INTO calls (tenant_id, asterisk_uniqueid, caller_number, called_number, queue_id, status, started_at)
          SELECT $1, $2, $3, $4, q.id, 'ringing', NOW()
@@ -51,7 +58,6 @@ function setupEventHandlers() {
         [tenantId, uniqueid, calleridnum, destchannel || queue, queue]
       );
 
-      // Broadcast to frontend
       global.io?.to(`tenant:${tenantId}`).emit('call:incoming', {
         uniqueid, callerNumber: calleridnum, queue
       });
@@ -60,11 +66,9 @@ function setupEventHandlers() {
     }
   });
 
-  // Call answered by agent
   ami.on('AgentConnect', async (event) => {
     try {
-      const { member, uniqueid, queue } = event;
-      // Extract SIP username from channel (SIP/sip_tenant_1001-xxxx)
+      const { member, uniqueid } = event;
       const sipUser = member?.replace(/^SIP\//, '').split('-')[0];
 
       const agentResult = await pool.query(
@@ -87,8 +91,6 @@ function setupEventHandlers() {
         global.io?.to(`tenant:${call.tenant_id}`).emit('call:answered', {
           uniqueid, agentId: agent.id, agentName: agent.name
         });
-
-        // Update agent status to busy
         await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['busy', agent.id]);
         global.io?.to(`tenant:${call.tenant_id}`).emit('agent:status:updated', {
           agentId: agent.id, status: 'busy'
@@ -99,11 +101,9 @@ function setupEventHandlers() {
     }
   });
 
-  // Call ended
   ami.on('Hangup', async (event) => {
     try {
       const { uniqueid, duration } = event;
-
       const callResult = await pool.query(
         `UPDATE calls SET ended_at = NOW(), duration_seconds = $1,
          status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'missed' END
@@ -113,15 +113,12 @@ function setupEventHandlers() {
 
       if (callResult.rows[0]) {
         const call = callResult.rows[0];
-
-        // Release agent back to online
         if (call.agent_id) {
           await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['online', call.agent_id]);
           global.io?.to(`tenant:${call.tenant_id}`).emit('agent:status:updated', {
             agentId: call.agent_id, status: 'online'
           });
         }
-
         global.io?.to(`tenant:${call.tenant_id}`).emit('call:ended', {
           uniqueid, duration: call.duration_seconds, status: call.status
         });
@@ -131,7 +128,6 @@ function setupEventHandlers() {
     }
   });
 
-  // Queue call abandoned (caller hung up waiting)
   ami.on('QueueCallerAbandon', async (event) => {
     try {
       const { uniqueid } = event;

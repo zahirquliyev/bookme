@@ -119,8 +119,7 @@ async function start() {
     await redisClient.connect();
     console.log('✅ Redis connected');
 
-    await initAMI();
-    console.log('✅ Asterisk AMI connected');
+    try { await initAMI(); console.log('✅ Asterisk AMI ready'); } catch(e) { console.warn('⚠️  AMI unavailable:', e.message); }
 
     server.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
