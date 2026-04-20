@@ -8,14 +8,9 @@ RUN apt-get update && apt-get install -y \
     php8.1-cli \
     php8.1-pgsql \
     php8.1-curl \
-    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Download phpagi library
-RUN wget -q https://raw.githubusercontent.com/nagi/phpagi/master/phpagi.php \
-    -O /usr/share/asterisk/agi-bin/phpagi.php
-
-# Copy AGI scripts
+# Copy AGI scripts (phpagi.php is bundled in agi/ directory)
 COPY agi/ /usr/share/asterisk/agi-bin/
 RUN chmod +x /usr/share/asterisk/agi-bin/*.php
 
