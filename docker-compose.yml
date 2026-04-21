@@ -51,6 +51,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-strongpassword123}
     volumes:
       - recordings:/var/spool/asterisk/monitor
+      - ./asterisk/agents_dynamic.conf:/etc/asterisk/agents_dynamic.conf
     depends_on:
       postgres:
         condition: service_healthy
