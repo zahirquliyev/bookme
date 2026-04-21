@@ -3,9 +3,9 @@ const { pool } = require('../db/pool');
 
 let ami = null;
 let amiConnected = false;
+let handlersSet = false;
 
 async function initAMI() {
-  // Non-blocking — returns immediately, connects in background
   connectAMI();
   return Promise.resolve();
 }
@@ -25,7 +25,10 @@ function connectAMI() {
     ami.on('connect', () => {
       amiConnected = true;
       console.log('✅ Asterisk AMI connected');
-      setupEventHandlers();
+      if (!handlersSet) {
+        setupEventHandlers();
+        handlersSet = true;
+      }
     });
 
     ami.on('close', () => {
@@ -35,7 +38,6 @@ function connectAMI() {
 
     ami.on('error', (err) => {
       amiConnected = false;
-      // Suppress ECONNREFUSED spam — Asterisk may not be ready yet
       if (err.code !== 'ECONNREFUSED') {
         console.warn('⚠️  AMI error:', err.message);
       }
@@ -49,7 +51,104 @@ function connectAMI() {
 function setupEventHandlers() {
   if (!ami) return;
 
-  ami.on('QueueCallerJoin', async (event) => {
+  // PeerStatus — agent online/offline
+  ami.on('peerstatus', async (event) => {
+    try {
+      const sipUser = event.peer?.replace(/^SIP\//, '');
+      if (!sipUser) return;
+      const newStatus = event.peerstatus === 'Registered' ? 'online' : 'offline';
+      const result = await pool.query(
+        'UPDATE agents SET status = $1 WHERE sip_username = $2 RETURNING id, tenant_id, status',
+        [newStatus, sipUser]
+      );
+      if (result.rows[0]) {
+        const { id, tenant_id, status } = result.rows[0];
+        console.log(`Agent ${sipUser} → ${status}`);
+        global.io?.to(`tenant:${tenant_id}`).emit('agent:status:updated', { agentId: id, status });
+      }
+    } catch (err) {
+      console.error('peerstatus error:', err);
+    }
+  });
+
+  // DialBegin — agent-to-agent call started
+  ami.on('dialbegin', async (event) => {
+    try {
+      const callerNum = event.calleridnum;
+      const destNum = event.destcalleridnum;
+      const uniqueid = event.uniqueid;
+
+      console.log(`DialBegin: ${callerNum} → ${destNum} [${uniqueid}]`);
+
+      const callerResult = await pool.query(
+        'SELECT * FROM agents WHERE extension = $1', [callerNum]
+      );
+      if (!callerResult.rows[0]) return;
+      const caller = callerResult.rows[0];
+
+      await pool.query(
+        `INSERT INTO calls (tenant_id, asterisk_uniqueid, caller_number, called_number, agent_id, call_type, direction, status, started_at)
+         VALUES ($1, $2, $3, $4, $5, 'internal', 'internal', 'ringing', NOW())
+         ON CONFLICT DO NOTHING`,
+        [caller.tenant_id, uniqueid, callerNum, destNum, caller.id]
+      );
+
+      global.io?.to(`tenant:${caller.tenant_id}`).emit('call:incoming', {
+        uniqueid, callerNumber: callerNum, calledNumber: destNum, type: 'internal'
+      });
+    } catch (err) {
+      console.error('dialbegin error:', err);
+    }
+  });
+
+  // DialEnd — call answered or missed
+  ami.on('dialend', async (event) => {
+    try {
+      const uniqueid = event.uniqueid;
+      const status = event.dialstatus === 'ANSWER' ? 'answered' : 'missed';
+      const result = await pool.query(
+        `UPDATE calls SET status = $1, answered_at = CASE WHEN $1 = 'answered' THEN NOW() ELSE NULL END
+         WHERE asterisk_uniqueid = $2 RETURNING *`,
+        [status, uniqueid]
+      );
+      if (result.rows[0]) {
+        const call = result.rows[0];
+        global.io?.to(`tenant:${call.tenant_id}`).emit('call:answered', { uniqueid, status });
+      }
+    } catch (err) {
+      console.error('dialend error:', err);
+    }
+  });
+
+  // Hangup — call ended
+  ami.on('hangup', async (event) => {
+    try {
+      const { uniqueid, duration } = event;
+      const result = await pool.query(
+        `UPDATE calls SET ended_at = NOW(), duration_seconds = $1,
+         status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'missed' END
+         WHERE asterisk_uniqueid = $2 AND ended_at IS NULL RETURNING *`,
+        [parseInt(duration) || 0, uniqueid]
+      );
+      if (result.rows[0]) {
+        const call = result.rows[0];
+        if (call.agent_id) {
+          await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['online', call.agent_id]);
+          global.io?.to(`tenant:${call.tenant_id}`).emit('agent:status:updated', {
+            agentId: call.agent_id, status: 'online'
+          });
+        }
+        global.io?.to(`tenant:${call.tenant_id}`).emit('call:ended', {
+          uniqueid, duration: call.duration_seconds, status: call.status
+        });
+      }
+    } catch (err) {
+      console.error('hangup error:', err);
+    }
+  });
+
+  // QueueCallerJoin
+  ami.on('queuecallerjoin', async (event) => {
     try {
       const { calleridnum, destchannel, queue, uniqueid } = event;
       const queueResult = await pool.query(
@@ -57,7 +156,6 @@ function setupEventHandlers() {
       );
       if (!queueResult.rows[0]) return;
       const tenantId = queueResult.rows[0].tenant_id;
-
       await pool.query(
         `INSERT INTO calls (tenant_id, asterisk_uniqueid, caller_number, called_number, queue_id, status, started_at)
          SELECT $1, $2, $3, $4, q.id, 'ringing', NOW()
@@ -68,11 +166,12 @@ function setupEventHandlers() {
         uniqueid, callerNumber: calleridnum, queue
       });
     } catch (err) {
-      console.error('QueueCallerJoin error:', err);
+      console.error('queuecallerjoin error:', err);
     }
   });
 
-  ami.on('AgentConnect', async (event) => {
+  // AgentConnect
+  ami.on('agentconnect', async (event) => {
     try {
       const { member, uniqueid } = event;
       const sipUser = member?.replace(/^SIP\//, '').split('-')[0];
@@ -81,7 +180,6 @@ function setupEventHandlers() {
       );
       if (!agentResult.rows[0]) return;
       const agent = agentResult.rows[0];
-
       const callResult = await pool.query(
         `UPDATE calls SET agent_id = $1, status = 'answered', answered_at = NOW()
          WHERE asterisk_uniqueid = $2 RETURNING *`,
@@ -100,37 +198,12 @@ function setupEventHandlers() {
         });
       }
     } catch (err) {
-      console.error('AgentConnect error:', err);
+      console.error('agentconnect error:', err);
     }
   });
 
-  ami.on('Hangup', async (event) => {
-    try {
-      const { uniqueid, duration } = event;
-      const callResult = await pool.query(
-        `UPDATE calls SET ended_at = NOW(), duration_seconds = $1,
-         status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'missed' END
-         WHERE asterisk_uniqueid = $2 AND ended_at IS NULL RETURNING *`,
-        [parseInt(duration) || 0, uniqueid]
-      );
-      if (callResult.rows[0]) {
-        const call = callResult.rows[0];
-        if (call.agent_id) {
-          await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['online', call.agent_id]);
-          global.io?.to(`tenant:${call.tenant_id}`).emit('agent:status:updated', {
-            agentId: call.agent_id, status: 'online'
-          });
-        }
-        global.io?.to(`tenant:${call.tenant_id}`).emit('call:ended', {
-          uniqueid, duration: call.duration_seconds, status: call.status
-        });
-      }
-    } catch (err) {
-      console.error('Hangup error:', err);
-    }
-  });
-
-  ami.on('QueueCallerAbandon', async (event) => {
+  // QueueCallerAbandon
+  ami.on('queuecallerabandon', async (event) => {
     try {
       const { uniqueid } = event;
       const result = await pool.query(
@@ -142,7 +215,7 @@ function setupEventHandlers() {
         global.io?.to(`tenant:${result.rows[0].tenant_id}`).emit('call:abandoned', { uniqueid });
       }
     } catch (err) {
-      console.error('QueueCallerAbandon error:', err);
+      console.error('queuecallerabandon error:', err);
     }
   });
 }
