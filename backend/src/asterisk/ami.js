@@ -107,7 +107,7 @@ function setupEventHandlers() {
       const uniqueid = event.uniqueid;
       const status = event.dialstatus === 'ANSWER' ? 'answered' : 'missed';
       const result = await pool.query(
-        `UPDATE calls SET status = $1, answered_at = CASE WHEN $1 = 'answered' THEN NOW() ELSE NULL END
+        `UPDATE calls SET status = $1, answered_at = CASE WHEN $1 = 'answered'::text THEN NOW() ELSE NULL END
          WHERE asterisk_uniqueid = $2 RETURNING *`,
         [status, uniqueid]
       );
