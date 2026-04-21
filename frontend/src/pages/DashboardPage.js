@@ -12,12 +12,14 @@ export default function DashboardPage() {
 
   const fetchAll = useCallback(async () => {
     try {
+      console.log('fetchAll called');
       const [s, ac, ag, an] = await Promise.all([
         api.get('/tenants/stats'),
         api.get('/calls/active'),
         api.get('/agents'),
         api.get('/calls/analytics/summary?days=7'),
       ]);
+      console.log('setStats:', s.data);
       setStats(s.data);
       setActiveCalls(ac.data);
       setAgents(ag.data);
@@ -46,12 +48,12 @@ export default function DashboardPage() {
     }
   }, [fetchAll]));
 
-  const statCards = stats ? [
-    { label: 'Bugünkü zənglər',  value: stats.today.total,    icon: '📞', color: '#3b82f6' },
-    { label: 'Cavablandırıldı',  value: stats.today.answered,  icon: '✅', color: '#22c55e' },
-    { label: 'Buraxıldı',        value: stats.today.missed,    icon: '❌', color: '#ef4444' },
-    { label: 'Ort. müddət (san)', value: stats.today.avgDuration, icon: '⏱', color: '#f59e0b' },
-  ] : [];
+  const statCards = [
+    { label: 'Bugünkü zənglər',  value: stats?.today?.total ?? 0,    icon: '📞', color: '#3b82f6' },
+    { label: 'Cavablandırıldı',  value: stats?.today?.answered ?? 0,  icon: '✅', color: '#22c55e' },
+    { label: 'Buraxıldı',        value: stats?.today?.missed ?? 0,    icon: '❌', color: '#ef4444' },
+    { label: 'Ort. müddət (san)', value: stats?.today?.avgDuration ?? 0, icon: '⏱', color: '#f59e0b' },
+  ];
 
   const statusColor = { online: '#22c55e', busy: '#f59e0b', paused: '#94a3b8', offline: '#64748b' };
   const statusLabel = { online: 'Onlayn', busy: 'Məşğul', paused: 'Fasilə', offline: 'Oflayn' };

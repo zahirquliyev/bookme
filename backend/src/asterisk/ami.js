@@ -105,30 +105,42 @@ function setupEventHandlers() {
   ami.on('dialend', async (event) => {
     try {
       const uniqueid = event.uniqueid;
-      const status = event.dialstatus === 'ANSWER' ? 'answered' : 'missed';
+      const isAnswered = event.dialstatus === 'ANSWER';
+      console.log('DialEnd:', uniqueid, event.dialstatus);
+      if (isAnswered) {
+        await pool.query(
+          `UPDATE calls SET status = 'answered', answered_at = NOW() WHERE asterisk_uniqueid = $1`,
+          [uniqueid]
+        );
+      } else {
+        await pool.query(
+          `UPDATE calls SET status = 'missed' WHERE asterisk_uniqueid = $1`,
+          [uniqueid]
+        );
+      }
       const result = await pool.query(
-        `UPDATE calls SET status = $1, answered_at = CASE WHEN $1 = 'answered'::text THEN NOW() ELSE NULL END
-         WHERE asterisk_uniqueid = $2 RETURNING *`,
-        [status, uniqueid]
+        `SELECT * FROM calls WHERE asterisk_uniqueid = $1`, [uniqueid]
       );
       if (result.rows[0]) {
         const call = result.rows[0];
-        global.io?.to(`tenant:${call.tenant_id}`).emit('call:answered', { uniqueid, status });
+        global.io?.to(`tenant:${call.tenant_id}`).emit('call:answered', { uniqueid, status: call.status });
       }
     } catch (err) {
-      console.error('dialend error:', err);
+      console.error('dialend error:', err.message);
     }
   });
 
   // Hangup — call ended
   ami.on('hangup', async (event) => {
     try {
-      const { uniqueid, duration } = event;
+      const { uniqueid } = event;
       const result = await pool.query(
-        `UPDATE calls SET ended_at = NOW(), duration_seconds = $1,
+        `UPDATE calls SET ended_at = NOW(),
+         duration_seconds = CASE WHEN answered_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW() - answered_at))::int ELSE 0 END,
+         wait_time_seconds = CASE WHEN answered_at IS NOT NULL THEN EXTRACT(EPOCH FROM (answered_at - started_at))::int ELSE EXTRACT(EPOCH FROM (NOW() - started_at))::int END,
          status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'missed' END
-         WHERE asterisk_uniqueid = $2 AND ended_at IS NULL RETURNING *`,
-        [parseInt(duration) || 0, uniqueid]
+         WHERE asterisk_uniqueid = $1 AND ended_at IS NULL RETURNING *`,
+        [uniqueid]
       );
       if (result.rows[0]) {
         const call = result.rows[0];
